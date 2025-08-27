@@ -3,7 +3,7 @@ on:
   workflow_dispatch:
     inputs:
       installer_url:
-        description: "HTTPS URL to your .pkg/.dmg OR a .zip containing one (nested zips ok)"
+        description: "HTTPS URL to .pkg/.dmg OR a .zip containing one (nested zips ok)"
         required: false
 
 jobs:
@@ -31,43 +31,54 @@ jobs:
         id: detect
         run: |
           set -euxo pipefail
-          # DMG?
+          # Direct DMG?
           if hdiutil imageinfo installer.bin >/dev/null 2>&1; then
             mv installer.bin build.dmg
             echo "type=dmg"  >> $GITHUB_OUTPUT
             echo "path=$PWD/build.dmg" >> $GITHUB_OUTPUT
             exit 0
           fi
-          # PKG?
+          # Direct PKG?
           if xar -tf installer.bin >/dev/null 2>&1; then
             mv installer.bin build.pkg
             echo "type=pkg"  >> $GITHUB_OUTPUT
             echo "path=$PWD/build.pkg" >> $GITHUB_OUTPUT
             exit 0
           fi
-          # ZIP? (recurse up to 3 nested zips)
+          # ZIP (handle nested zips; detect .app as a directory)
           if unzip -tq installer.bin >/dev/null 2>&1; then
             rm -rf unzipped && mkdir -p unzipped
             unzip -q installer.bin -d unzipped
+            # quick tree for logs
+            (cd unzipped && /usr/bin/find . -maxdepth 4 -print) | sed 's/^/unzipped: /' | tee unzipped.txt
             for i in 1 2 3; do
-              FOUND=$(find unzipped -type f \( -name "*.pkg" -o -name "*.dmg" -o -name "*.app" \) | head -n1 || true)
-              if [ -n "$FOUND" ]; then
-                case "$FOUND" in
+              # 1) prefer PKG/DMG files
+              FOUND_FILE=$(find unzipped -maxdepth 8 -type f \( -name "*.pkg" -o -name "*.dmg" \) | head -n1 || true)
+              if [ -n "$FOUND_FILE" ]; then
+                case "$FOUND_FILE" in
                   *.pkg) echo "type=pkg" >> $GITHUB_OUTPUT ;;
                   *.dmg) echo "type=dmg" >> $GITHUB_OUTPUT ;;
-                  *.app) echo "type=app" >> $GITHUB_OUTPUT ;;
                 esac
-                echo "path=$FOUND" >> $GITHUB_OUTPUT
+                echo "path=$FOUND_FILE" >> $GITHUB_OUTPUT
                 exit 0
               fi
-              NZIP=$(find unzipped -type f -name "*.zip" | head -n1 || true)
+              # 2) .app bundles are directories
+              FOUND_APP=$(find unzipped -maxdepth 8 -type d -name "*.app" | head -n1 || true)
+              if [ -n "$FOUND_APP" ]; then
+                echo "type=app"  >> $GITHUB_OUTPUT
+                echo "path=$FOUND_APP" >> $GITHUB_OUTPUT
+                exit 0
+              fi
+              # 3) expand one more zip, skipping anything inside .app bundles
+              NZIP=$(find unzipped -maxdepth 8 -type f -name "*.zip" ! -path "*/.app/*" | head -n1 || true)
               [ -z "$NZIP" ] && break
               TMP="unzipped/nest_$i"
               mkdir -p "$TMP"
               unzip -q "$NZIP" -d "$TMP"
               rm -f "$NZIP"
             done
-            echo "No PKG/DMG/APP found inside zip after nested extraction"; exit 2
+            echo "No PKG/DMG/APP found inside zip after nested extraction" | tee -a unzipped.txt
+            exit 2
           fi
           echo "Unknown installer type"; exit 2
 
@@ -80,7 +91,7 @@ jobs:
           pkgutil --check-signature "$PKG" || true
           sudo installer -pkg "$PKG" -target / -verboseR | tee install.log
           pkgutil --pkgs | tee receipts.txt
-          # TODO: replace with your real bundle id:
+          # Replace with your real bundle id if you want a payload listing:
           pkgutil --files com.your.bundleid | tee files.txt || true
 
       - name: DMG install → /Applications
@@ -90,7 +101,7 @@ jobs:
           MNT=/Volumes/APPTEST
           hdiutil attach "${{ steps.detect.outputs.path }}" -mountpoint "$MNT" -nobrowse
           APP=$(ls "$MNT"/*.app | head -n1 || true)
-          [ -z "$APP" ] && { echo "No .app in DMG"; ls -la "$MNT"; exit 3; }
+          [ -z "$APP" ] && { echo "No .app in DMG"; ls -la "$MNT"; hdiutil detach "$MNT"; exit 3; }
           sudo cp -R "$APP" /Applications/
           hdiutil detach "$MNT"
           APPNAME=$(basename "$APP")
@@ -123,4 +134,5 @@ jobs:
             files.txt
             filetype.txt
             codesign.txt
+            unzipped.txt
           if-no-files-found: ignore
