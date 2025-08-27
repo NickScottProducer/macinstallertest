@@ -1,0 +1,99 @@
+name: macOS installer smoke test
+on:
+  workflow_dispatch:
+    inputs:
+      installer_url:
+        description: "HTTPS URL to your .pkg or .dmg (will override secret if set)"
+        required: false
+jobs:
+  test:
+    runs-on: macos-15
+    steps:
+      - name: Resolve installer URL
+        id: url
+        run: |
+          if [ -n "${{ github.event.inputs.installer_url }}" ]; then
+            echo "url=${{ github.event.inputs.installer_url }}" >> $GITHUB_OUTPUT
+          elif [ -n "${{ secrets.INSTALLER_URL }}" ]; then
+            echo "url=${{ secrets.INSTALLER_URL }}" >> $GITHUB_OUTPUT
+          else
+            echo "No installer URL provided"; exit 1
+          fi
+
+      - name: Download installer
+        run: |
+          set -euxo pipefail
+          curl -L "${{ steps.url.outputs.url }}" -o installer.bin
+          file installer.bin | tee filetype.txt
+
+      - name: Identify type (DMG vs PKG)
+        run: |
+          if hdiutil imageinfo installer.bin >/dev/null 2>&1; then
+            mv installer.bin build.dmg
+          elif xar -tf installer.bin >/dev/null 2>&1; then
+            mv installer.bin build.pkg
+          else
+            echo "Unknown installer type"; exit 2
+          fi
+
+      - name: Install (PKG)
+        if: hashFiles('build.pkg') != ''
+        run: |
+          set -euxo pipefail
+          # Gatekeeper / signature info (advisory)
+          spctl --assess --type install -vv build.pkg || true
+          pkgutil --check-signature build.pkg || true
+          # Install verbosely, capture log
+          sudo installer -pkg build.pkg -target / -verboseR | tee install.log
+          # Receipts
+          pkgutil --pkgs | tee receipts.txt
+          # List files in your package (replace com.your.bundleid)
+          pkgutil --files com.your.bundleid | tee files.txt || true
+
+      - name: Install (DMG → /Applications)
+        if: hashFiles('build.dmg') != ''
+        run: |
+          set -euxo pipefail
+          MNT=/Volumes/APPTEST
+          hdiutil attach build.dmg -mountpoint "$MNT" -nobrowse
+          # Try drag-copy first .app
+          APP=$(ls "$MNT"/*.app | head -n1 || true)
+          if [ -n "$APP" ]; then
+            sudo cp -R "$APP" /Applications/
+            sync
+          else
+            echo "No .app found in DMG"; ls -la "$MNT"; exit 3
+          fi
+          hdiutil detach "$MNT"
+          # Gatekeeper/codesign checks
+          APPNAME=$(basename "$APP")
+          /usr/bin/codesign -dv --verbose=4 "/Applications/$APPNAME" 2>&1 | tee codesign.txt
+          /usr/bin/spctl --assess --type execute -vv "/Applications/$APPNAME" || true
+
+      - name: Audio plug-in sanity (AU/VST3)
+        run: |
+          set -euxo pipefail
+          ls -al "/Library/Audio/Plug-Ins/Components" || true
+          ls -al "/Library/Audio/Plug-Ins/VST3" || true
+          # AU validation listing
+          /usr/bin/auval -a || true
+
+      - name: Architecture checks (optional)
+        run: |
+          # Replace paths as needed
+          if [ -d "/Applications/YourApp.app" ]; then
+            file "/Applications/YourApp.app/Contents/MacOS/"* || true
+            lipo -archs "/Applications/YourApp.app/Contents/MacOS/"* || true
+          fi
+
+      - name: Upload logs
+        uses: actions/upload-artifact@v4
+        with:
+          name: macos-install-logs
+          path: |
+            install.log
+            receipts.txt
+            files.txt
+            filetype.txt
+            codesign.txt
+          if-no-files-found: ignore
