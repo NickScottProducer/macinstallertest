@@ -3,7 +3,7 @@ on:
   workflow_dispatch:
     inputs:
       installer_url:
-        description: "HTTPS URL to your .pkg/.dmg OR .zip containing one"
+        description: "HTTPS URL to your .pkg/.dmg OR a .zip containing one (nested zips ok)"
         required: false
 
 jobs:
@@ -27,7 +27,7 @@ jobs:
           curl -L "${{ steps.url.outputs.url }}" -o installer.bin
           file installer.bin | tee filetype.txt
 
-      - name: Identify installer type and path (DMG/PKG/ZIP/APP)
+      - name: Identify installer type and path (DMG/PKG/ZIP/APP; supports nested ZIP)
         id: detect
         run: |
           set -euxo pipefail
@@ -45,24 +45,31 @@ jobs:
             echo "path=$PWD/build.pkg" >> $GITHUB_OUTPUT
             exit 0
           fi
-          # ZIP?
+          # ZIP? (recurse up to 3 nested zips)
           if unzip -tq installer.bin >/dev/null 2>&1; then
             rm -rf unzipped && mkdir -p unzipped
             unzip -q installer.bin -d unzipped
-            echo "unzipped tree:"; find unzipped -maxdepth 3 -print | sed 's/^/  /' | tee unzipped.txt
-            FOUND=$(find unzipped -maxdepth 4 -type f \( -name "*.pkg" -o -name "*.dmg" -o -name "*.app" \) | head -n1 || true)
-            if [ -z "$FOUND" ]; then
-              echo "No PKG/DMG/APP found inside zip"; exit 2
-            fi
-            case "$FOUND" in
-              *.pkg) echo "type=pkg" ;;
-              *.dmg) echo "type=dmg" ;;
-              *.app) echo "type=app" ;;
-            esac >> $GITHUB_OUTPUT
-            echo "path=$FOUND" >> $GITHUB_OUTPUT
-            exit 0
+            for i in 1 2 3; do
+              FOUND=$(find unzipped -type f \( -name "*.pkg" -o -name "*.dmg" -o -name "*.app" \) | head -n1 || true)
+              if [ -n "$FOUND" ]; then
+                case "$FOUND" in
+                  *.pkg) echo "type=pkg" >> $GITHUB_OUTPUT ;;
+                  *.dmg) echo "type=dmg" >> $GITHUB_OUTPUT ;;
+                  *.app) echo "type=app" >> $GITHUB_OUTPUT ;;
+                esac
+                echo "path=$FOUND" >> $GITHUB_OUTPUT
+                exit 0
+              fi
+              NZIP=$(find unzipped -type f -name "*.zip" | head -n1 || true)
+              [ -z "$NZIP" ] && break
+              TMP="unzipped/nest_$i"
+              mkdir -p "$TMP"
+              unzip -q "$NZIP" -d "$TMP"
+              rm -f "$NZIP"
+            done
+            echo "No PKG/DMG/APP found inside zip after nested extraction"; exit 2
           fi
-          echo "Unknown installer type"; file installer.bin; exit 2
+          echo "Unknown installer type"; exit 2
 
       - name: PKG install
         if: steps.detect.outputs.type == 'pkg'
@@ -73,7 +80,7 @@ jobs:
           pkgutil --check-signature "$PKG" || true
           sudo installer -pkg "$PKG" -target / -verboseR | tee install.log
           pkgutil --pkgs | tee receipts.txt
-          # Replace com.your.bundleid with your real one to list payload files:
+          # TODO: replace with your real bundle id:
           pkgutil --files com.your.bundleid | tee files.txt || true
 
       - name: DMG install → /Applications
@@ -83,7 +90,7 @@ jobs:
           MNT=/Volumes/APPTEST
           hdiutil attach "${{ steps.detect.outputs.path }}" -mountpoint "$MNT" -nobrowse
           APP=$(ls "$MNT"/*.app | head -n1 || true)
-          if [ -z "$APP" ]; then echo "No .app in DMG"; ls -la "$MNT"; exit 3; fi
+          [ -z "$APP" ] && { echo "No .app in DMG"; ls -la "$MNT"; exit 3; }
           sudo cp -R "$APP" /Applications/
           hdiutil detach "$MNT"
           APPNAME=$(basename "$APP")
@@ -116,5 +123,4 @@ jobs:
             files.txt
             filetype.txt
             codesign.txt
-            unzipped.txt
           if-no-files-found: ignore
