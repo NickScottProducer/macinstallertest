@@ -1,0 +1,32 @@
+name: Verify DMG
+on:
+  workflow_dispatch:
+    inputs:
+      dmg_url:
+        description: "HTTPS link to your .dmg"
+        required: true
+jobs:
+  verify:
+    runs-on: macos-15
+    steps:
+      - name: Download & mount
+        env: { DMG_URL: ${{ github.event.inputs.dmg_url }} }
+        run: |
+          set -euxo pipefail
+          curl -L "$DMG_URL" -o in.dmg
+          hdiutil attach in.dmg -mountpoint /Volumes/CHK -nobrowse
+          echo "--- DMG root ---"; find /Volumes/CHK -maxdepth 2 -print
+          APP=$(find /Volumes/CHK -maxdepth 1 -type d -name "*.app" -print -quit || true)
+          if [ -n "$APP" ]; then
+            /usr/bin/codesign -dv --verbose=4 "$APP" 2>&1 | tee codesign.txt
+            /usr/bin/spctl --assess --type execute -vv "$APP" 2>&1 | tee spctl.txt || true
+          fi
+          hdiutil detach /Volumes/CHK
+      - name: Upload logs
+        uses: actions/upload-artifact@v4
+        with:
+          name: verify-logs
+          path: |
+            codesign.txt
+            spctl.txt
+          if-no-files-found: ignore
