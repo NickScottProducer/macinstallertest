@@ -1,0 +1,131 @@
+name: Repair & Repack DMG (from existing DMG)
+
+on:
+  workflow_dispatch:
+    inputs:
+      dmg_url:
+        description: "HTTPS link to the existing .dmg you want to fix"
+        required: true
+
+jobs:
+  repair:
+    runs-on: macos-15
+    steps:
+      - name: Download DMG
+        run: |
+          set -euxo pipefail
+          curl -L "${{ github.event.inputs.dmg_url }}" -o in.dmg
+          hdiutil imageinfo in.dmg || true
+
+      - name: Mount & inspect DMG
+        id: inspect
+        run: |
+          set -euxo pipefail
+          MNT=/Volumes/REPAIRDMG
+          hdiutil attach in.dmg -mountpoint "$MNT" -nobrowse
+          echo "--- DMG root listing ---"
+          find "$MNT" -maxdepth 2 -print | sed 's/^/  /'
+          echo "root_listing=$(find "$MNT" -maxdepth 2 -print | wc -l | tr -d ' ')" >> $GITHUB_OUTPUT
+
+          # Try to find a proper .app at DMG root first
+          APP=$(find "$MNT" -maxdepth 1 -type d -name "*.app" -print -quit || true)
+          if [ -n "$APP" ]; then
+            echo "mode=app" >> $GITHUB_OUTPUT
+            echo "app=$APP"  >> $GITHUB_OUTPUT
+          else
+            # If we see a stray Contents/ folder at root, wrap it into an .app
+            if [ -d "$MNT/Contents" ]; then
+              echo "mode=contents" >> $GITHUB_OUTPUT
+            # Or if there is an APP.bundle at root, treat it as an app
+            elif [ -d "$MNT/APP.bundle" ]; then
+              echo "mode=bundle" >> $GITHUB_OUTPUT
+              echo "bundle=$MNT/APP.bundle" >> $GITHUB_OUTPUT
+            else
+              echo "mode=unknown" >> $GITHUB_OUTPUT
+            fi
+          fi
+          hdiutil detach "$MNT"
+
+      - name: Extract/repair app from DMG
+        id: extract
+        run: |
+          set -euxo pipefail
+          MNT=/Volumes/REPAIRDMG
+          hdiutil attach in.dmg -mountpoint "$MNT" -nobrowse
+
+          MODE="${{ steps.inspect.outputs.mode }}"
+          OUT="$PWD/WillowKickSnareInstaller.app"
+
+          if [ "$MODE" = "app" ]; then
+            APP="${{ steps.inspect.outputs.app }}"
+            cp -R "$APP" "$OUT"
+
+          elif [ "$MODE" = "contents" ]; then
+            # Build a correct app bundle around a stray Contents/ dir
+            mkdir -p "$OUT"
+            cp -R "$MNT/Contents" "$OUT/Contents"
+
+          elif [ "$MODE" = "bundle" ]; then
+            cp -R "${{ steps.inspect.outputs.bundle }}" "$OUT"
+            mv "$OUT" "${OUT%.app}.app" || true
+            OUT="${OUT%.app}.app"
+
+          else
+            echo "Could not locate an app in the DMG. See listing above."; find "$MNT" -maxdepth 2 -print; hdiutil detach "$MNT"; exit 2
+          fi
+
+          hdiutil detach "$MNT"
+
+          # Ensure it is a *real* app bundle and fix common issues
+          [ -d "$OUT/Contents" ] || { echo "No Contents in app bundle"; exit 2; }
+          if [ -d "$OUT/Contents/MacOS" ]; then
+            find "$OUT/Contents/MacOS" -type f -exec chmod +x {} \; || true
+          fi
+          PLIST="$OUT/Contents/Info.plist"
+          if [ -f "$PLIST" ]; then
+            /usr/libexec/PlistBuddy -c 'Set :CFBundlePackageType APPL' "$PLIST" || true
+          fi
+
+          echo "app=$OUT" >> $GITHUB_OUTPUT
+          echo "App bundle repaired at: $OUT"
+
+      - name: Build clean DMG with Applications alias
+        run: |
+          set -euxo pipefail
+          APP="${{ steps.extract.outputs.app }}"
+          APPNAME=$(basename "$APP")
+          STAGE="dmg-root"; VOL="Willow Kick Snare Installer"
+          rm -rf "$STAGE" "Willow_Kick_Snare_Installer_fixed.dmg"
+          mkdir -p "$STAGE"
+          cp -R "$APP" "$STAGE/"
+          ln -s /Applications "$STAGE/Applications"
+          # Final safety: main executables must be executable
+          if [ -d "$STAGE/$APPNAME/Contents/MacOS" ]; then
+            find "$STAGE/$APPNAME/Contents/MacOS" -type f -exec chmod +x {} \; || true
+          fi
+          hdiutil create -volname "$VOL" -srcfolder "$STAGE" -fs HFS+ -format UDZO "Willow_Kick_Snare_Installer_fixed.dmg"
+
+      - name: Sanity test the fixed DMG
+        run: |
+          set -euxo pipefail
+          MNT=/Volumes/APPTEST
+          hdiutil attach "Willow_Kick_Snare_Installer_fixed.dmg" -mountpoint "$MNT" -nobrowse
+          echo "--- fixed DMG root ---"; find "$MNT" -maxdepth 1 -print
+          APP=$(find "$MNT" -maxdepth 1 -type d -name "*.app" -print -quit || true)
+          if [ -z "$APP" ]; then
+            echo "❌ Fixed DMG still lacks a .app at root"; find "$MNT" -maxdepth 2 -print; hdiutil detach "$MNT"; exit 3
+          fi
+          sudo cp -R "$APP" /Applications/
+          hdiutil detach "$MNT"
+          APPNAME=$(basename "$APP")
+          /usr/bin/codesign -dv --verbose=4 "/Applications/$APPNAME" 2>&1 | tee codesign.txt
+          /usr/bin/spctl --assess --type execute -vv "/Applications/$APPNAME" 2>&1 | tee spctl.txt || true
+
+      - name: Upload fixed DMG + logs
+        uses: actions/upload-artifact@v4
+        with:
+          name: repacked
+          path: |
+            Willow_Kick_Snare_Installer_fixed.dmg
+            codesign.txt
+            spctl.txt
