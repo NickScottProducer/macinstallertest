@@ -1,0 +1,164 @@
+name: macOS repair & repack
+
+on:
+  workflow_dispatch:
+    inputs:
+      installer_url:
+        description: "HTTPS URL to your current (possibly nested) ZIP/DMG/PKG"
+        required: true
+      bundle_id:
+        description: "CFBundleIdentifier (reverse-DNS)"
+        required: false
+        default: "com.nickscottproducer.willowkicksnare.installer"
+      version:
+        description: "CFBundleShortVersionString"
+        required: false
+        default: "1.0.0"
+      make_dmg:
+        description: "Create .dmg (true) or .zip (false)"
+        required: false
+        default: "true"
+
+jobs:
+  repack:
+    runs-on: macos-15
+    steps:
+      - name: Fetch input
+        run: |
+          set -euxo pipefail
+          echo "URL: ${{ github.event.inputs.installer_url }}"
+          curl -L "${{ github.event.inputs.installer_url }}" -o installer.bin
+          file installer.bin | tee filetype.txt
+
+      - name: Unwrap (supports nested ZIP) → find .app
+        id: unwrap
+        run: |
+          set -euxo pipefail
+          # DMG?
+          if hdiutil imageinfo installer.bin >/dev/null 2>&1; then
+            MNT=/Volumes/REPACKSRC
+            hdiutil attach installer.bin -mountpoint "$MNT" -nobrowse
+            APP="$(ls "$MNT"/*.app | head -n1 || true)"
+            [ -z "$APP" ] && { echo "No .app found in DMG"; ls -la "$MNT"; exit 2; }
+            cp -R "$APP" ./APP.bundle
+            hdiutil detach "$MNT"
+            echo "app=APP.bundle" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+
+          # PKG?
+          if xar -tf installer.bin >/dev/null 2>&1; then
+            echo "Provided a .pkg; cannot reliably extract .app from payload here."
+            echo "Upload a ZIP/DMG containing the .app instead." >&2
+            exit 3
+          fi
+
+          # ZIP (handle nested)
+          if unzip -tq installer.bin >/dev/null 2>&1; then
+            rm -rf unzipped && mkdir -p unzipped
+            unzip -q installer.bin -d unzipped
+            for i in 1 2 3; do
+              APP=$(find unzipped -maxdepth 8 -type d -name "*.app" | head -n1 || true)
+              if [ -n "$APP" ]; then
+                cp -R "$APP" ./APP.bundle
+                echo "app=APP.bundle" >> $GITHUB_OUTPUT
+                exit 0
+              fi
+              NZIP=$(find unzipped -maxdepth 8 -type f -name "*.zip" ! -path "*/.app/*" | head -n1 || true)
+              [ -z "$NZIP" ] && break
+              TMP="unzipped/nest_$i"
+              mkdir -p "$TMP"
+              unzip -q "$NZIP" -d "$TMP"
+              rm -f "$NZIP"
+            done
+            echo "No .app found after nested ZIP extraction" >&2
+            exit 4
+          fi
+
+          echo "Unknown input type; provide DMG or ZIP" >&2
+          exit 5
+
+      - name: Dedupe Python/Tk payload (Resources → Frameworks)
+        run: |
+          set -euxo pipefail
+          APP="${{ steps.unwrap.outputs.app }}"
+          RES="$APP/Contents/Resources"
+          FR="$APP/Contents/Frameworks"
+          echo "APP: $APP"
+          [ -d "$RES" ] || { echo "No Resources dir; skipping dedupe"; exit 0; }
+          [ -d "$FR" ]  || { echo "No Frameworks dir; skipping dedupe"; exit 0; }
+
+          # Remove well-known duplicate dirs from Resources (keep only in Frameworks)
+          for d in Python Python.framework lib-dynload tcl8 _tcl_data _tk_data site-packages; do
+            if [ -e "$RES/$d" ]; then
+              echo "Removing duplicate dir: $RES/$d"
+              rm -rf "$RES/$d"
+            fi
+          done
+
+          # Remove base_library.zip if also present (and identical) in Frameworks
+          if [ -f "$RES/base_library.zip" ] && [ -f "$FR/base_library.zip" ]; then
+            if cmp -s "$RES/base_library.zip" "$FR/base_library.zip"; then
+              echo "Removing duplicate: $RES/base_library.zip"
+              rm -f "$RES/base_library.zip"
+            fi
+          fi
+
+          # Remove duplicate dylibs in Resources if identical file exists in Frameworks
+          find "$RES" -maxdepth 1 -type f -name "*.dylib" | while read -r lib; do
+            base="$(basename "$lib")"
+            if [ -f "$FR/$base" ] && cmp -s "$lib" "$FR/$base"; then
+              echo "Removing duplicate dylib: $lib"
+              rm -f "$lib"
+            fi
+          done
+
+          echo "Post-dedupe tree:"
+          /usr/bin/find "$APP/Contents" -maxdepth 3 -print | sed 's/^/  /'
+
+      - name: Patch Info.plist (bundle id, version)
+        run: |
+          set -euxo pipefail
+          APP="${{ steps.unwrap.outputs.app }}"
+          PLIST="$APP/Contents/Info.plist"
+          BID="${{ github.event.inputs.bundle_id }}"
+          VER="${{ github.event.inputs.version }}"
+
+          plist_set() { /usr/libexec/PlistBuddy -c "Set :$1 $2" "$PLIST" || /usr/libexec/PlistBuddy -c "Add :$1 string $2" "$PLIST"; }
+          plist_set CFBundleIdentifier "$BID"
+          plist_set CFBundleShortVersionString "$VER"
+          /usr/libexec/PlistBuddy -c "Print" "$PLIST" | sed 's/^/  /'
+
+      # Optional: codesigning (uncomment and add secrets to actually sign + notarize)
+      # - name: Ad-hoc sign (placeholder)
+      #   run: |
+      #     APP="${{ steps.unwrap.outputs.app }}"
+      #     codesign --force --deep -s - --options runtime "$APP"
+      #
+      # - name: Notarize (requires APPLE_ID/APP_PW/TEAMID secrets)
+      #   run: |
+      #     APP="${{ steps.unwrap.outputs.app }}"
+      #     xcrun notarytool submit "$APP" --apple-id "${{ secrets.APPLE_ID }}" --team-id "${{ secrets.APPLE_TEAM_ID }}" --password "${{ secrets.APP_SPECIFIC_PW }}" --wait
+      #     xcrun stapler staple "$APP"
+
+      - name: Package (DMG or ZIP)
+        id: pack
+        run: |
+          set -euxo pipefail
+          APP="${{ steps.unwrap.outputs.app }}"
+          NAME="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleName' "$APP/Contents/Info.plist" 2>/dev/null || basename "$APP" .app)"
+          if [ "${{ github.event.inputs.make_dmg }}" = "true" ]; then
+            OUT="${NAME}.dmg"
+            hdiutil create -volname "$NAME" -srcfolder "$APP" -ov -format UDZO "$OUT"
+          else
+            OUT="${NAME}-macos.zip"
+            ditto -c -k --keepParent "$APP" "$OUT"
+          fi
+          echo "out=$OUT" >> $GITHUB_OUTPUT
+          ls -lh "$OUT"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: repaired-macos-installer
+          path: ${{ steps.pack.outputs.out }}
