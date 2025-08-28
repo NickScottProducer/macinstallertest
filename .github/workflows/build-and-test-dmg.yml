@@ -34,6 +34,7 @@ jobs:
           set -euxo pipefail
           ROOT="$PWD/work"
           rm -rf "$ROOT" && mkdir -p "$ROOT"
+
           # Direct DMG?
           if hdiutil imageinfo artifact.bin >/dev/null 2>&1; then
             mv artifact.bin "$ROOT/in.dmg"
@@ -41,6 +42,7 @@ jobs:
             echo "path=$ROOT/in.dmg" >> $GITHUB_OUTPUT
             exit 0
           fi
+
           # Direct PKG?
           if xar -tf artifact.bin >/dev/null 2>&1; then
             mv artifact.bin "$ROOT/in.pkg"
@@ -48,18 +50,12 @@ jobs:
             echo "path=$ROOT/in.pkg" >> $GITHUB_OUTPUT
             exit 0
           fi
-          # Direct .app (zipped as a single file sometimes)
-          if [ "$(echo artifact.bin | grep -ci '\.app$')" -gt 0 ]; then
-            mv artifact.bin "$ROOT/app.app"
-            echo "kind=app" >> $GITHUB_OUTPUT
-            echo "path=$ROOT/app.app" >> $GITHUB_OUTPUT
-            exit 0
-          fi
 
-          # Treat as ZIP (with optional nesting). Stop diving once we see .app/.pkg/.dmg.
+          # Treat as ZIP (with optional nesting up to 3 levels)
           UNZIP="$ROOT/unzipped"; mkdir -p "$UNZIP"
           if unzip -tq artifact.bin >/dev/null 2>&1; then
             unzip -q artifact.bin -d "$UNZIP"
+
             for i in 1 2 3; do
               # Prefer pkg/dmg files
               F=$(find "$UNZIP" -maxdepth 8 -type f \( -name "*.pkg" -o -name "*.dmg" \) | head -n1 || true)
@@ -71,21 +67,22 @@ jobs:
                 echo "path=$F" >> $GITHUB_OUTPUT
                 exit 0
               fi
-              # Then app bundles (dirs)
+
+              # Then app bundles (directories)
               APPDIR=$(find "$UNZIP" -maxdepth 8 -type d -name "*.app" | head -n1 || true)
               if [ -n "$APPDIR" ]; then
                 echo "kind=app" >> $GITHUB_OUTPUT
                 echo "path=$APPDIR" >> $GITHUB_OUTPUT
                 exit 0
               fi
-              # Some builds produce APP.bundle with a valid app layout → fix name/flags
+
+              # Some builds produce APP.bundle with an app layout → fix name/flags
               BUNDLEDIR=$(find "$UNZIP" -maxdepth 8 -type d -name "*.bundle" | head -n1 || true)
               if [ -n "$BUNDLEDIR" ]; then
                 PLIST="$BUNDLEDIR/Contents/Info.plist"
                 if [ -f "$PLIST" ]; then
                   /usr/libexec/PlistBuddy -c 'Set :CFBundlePackageType APPL' "$PLIST" || true
                 fi
-                # ensure the main binary is executable
                 if [ -d "$BUNDLEDIR/Contents/MacOS" ]; then
                   chmod +x "$BUNDLEDIR"/Contents/MacOS/* || true
                 fi
@@ -95,6 +92,7 @@ jobs:
                 echo "path=$APPFIX" >> $GITHUB_OUTPUT
                 exit 0
               fi
+
               # One more nested zip (but never unzip inside .app)
               NZIP=$(find "$UNZIP" -maxdepth 8 -type f -name "*.zip" ! -path "*/.app/*" | head -n1 || true)
               [ -z "$NZIP" ] && break
@@ -102,8 +100,10 @@ jobs:
               unzip -q "$NZIP" -d "$NDIR"
               rm -f "$NZIP"
             done
+
             echo "Could not find .app/.pkg/.dmg in supplied archive."; exit 2
           fi
+
           echo "Unknown input format."; exit 2
 
       - name: If DMG input, extract .app from it
@@ -114,8 +114,8 @@ jobs:
           DMG="${{ steps.find.outputs.path }}"
           MNT="/Volumes/INAPP"
           hdiutil attach "$DMG" -mountpoint "$MNT" -nobrowse
-          APP=$(ls "$MNT"/*.app | head -n1 || true)
-          [ -z "$APP" ] && { echo "No .app inside DMG"; ls -la "$MNT"; hdiutil detach "$MNT"; exit 3; }
+          APP=$(find "$MNT" -maxdepth 1 -type d -name "*.app" -print -quit || true)
+          [ -z "$APP" ] && { echo "No .app inside DMG"; find "$MNT" -maxdepth 2 -print; hdiutil detach "$MNT"; exit 3; }
           OUT="$PWD/extracted.app"
           cp -R "$APP" "$OUT"
           hdiutil detach "$MNT"
@@ -133,19 +133,37 @@ jobs:
             echo "app=" >> $GITHUB_OUTPUT
           fi
 
-      - name: Build DMG from app (adds Applications alias)
+      - name: Build DMG from app (validates .app; fixes “…/Contents”)
         if: steps.app_path.outputs.app != ''
         run: |
           set -euxo pipefail
           APP="${{ steps.app_path.outputs.app }}"
-          APPNAME=$(basename "$APP")
+
+          # If we were handed ".../Something.app/Contents", step back to the bundle root
+          case "$APP" in
+            */Contents) APP="$(dirname "$APP")" ;;
+          esac
+
+          # Must be a .app directory
+          if [ ! -d "$APP" ] || [[ "$APP" != *.app ]]; then
+            echo "Not a .app bundle: $APP"
+            echo "Bundle tree (if any):"
+            /usr/bin/find "$(dirname "$APP")" -maxdepth 2 -print || true
+            exit 2
+          fi
+
+          APPNAME="$(basename "$APP")"
           STAGE="dmg-root"; VOL="Willow Kick Snare Installer"
           rm -rf "$STAGE" "Willow_Kick_Snare_Installer.dmg"
           mkdir -p "$STAGE"
           cp -R "$APP" "$STAGE/"
           ln -s /Applications "$STAGE/Applications"
-          # Ensure exec bits for safety
-          find "$STAGE/$APPNAME/Contents/MacOS" -type f -exec chmod +x {} \; || true
+
+          # ensure main executables are executable
+          if [ -d "$STAGE/$APPNAME/Contents/MacOS" ]; then
+            find "$STAGE/$APPNAME/Contents/MacOS" -type f -exec chmod +x {} \; || true
+          fi
+
           hdiutil create -volname "$VOL" -srcfolder "$STAGE" -fs HFS+ -format UDZO "Willow_Kick_Snare_Installer.dmg"
 
       - name: Upload DMG (or original PKG if provided)
@@ -182,18 +200,28 @@ jobs:
             echo "done=" >> $GITHUB_OUTPUT
           fi
 
-      - name: Mount DMG and copy app → /Applications (if present)
+      - name: Mount DMG and copy app → /Applications (robust)
         if: steps.maybe_pkg.outputs.done != 'pkg'
         run: |
           set -euxo pipefail
           DMG=$(ls dist/*.dmg 2>/dev/null | head -n1 || true)
           [ -z "$DMG" ] && { echo "No DMG to test"; exit 0; }
+
           MNT=/Volumes/APPTEST
           hdiutil attach "$DMG" -mountpoint "$MNT" -nobrowse
-          APP=$(ls "$MNT"/*.app | head -n1 || true)
-          [ -z "$APP" ] && { echo "No .app inside DMG"; ls -la "$MNT"; hdiutil detach "$MNT"; exit 3; }
+
+          # Find a top-level .app (don’t dive into inner folders)
+          APP=$(find "$MNT" -maxdepth 1 -type d -name "*.app" -print -quit || true)
+          if [ -z "$APP" ]; then
+            echo "No .app at DMG root. Listing:"
+            find "$MNT" -maxdepth 2 -print
+            hdiutil detach "$MNT"
+            exit 3
+          fi
+
           sudo cp -R "$APP" /Applications/
           hdiutil detach "$MNT"
+
           APPNAME=$(basename "$APP")
           /usr/bin/codesign -dv --verbose=4 "/Applications/$APPNAME" 2>&1 | tee codesign.txt
           /usr/bin/spctl --assess --type execute -vv "/Applications/$APPNAME" 2>&1 | tee spctl.txt || true
