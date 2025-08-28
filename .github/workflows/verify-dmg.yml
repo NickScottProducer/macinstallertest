@@ -10,7 +10,8 @@ jobs:
     runs-on: macos-15
     steps:
       - name: Download & mount
-        env: { DMG_URL: ${{ github.event.inputs.dmg_url }} }
+        env:
+          DMG_URL: ${{ github.event.inputs.dmg_url }}
         run: |
           set -euxo pipefail
           curl -L "$DMG_URL" -o in.dmg
