@@ -1,4 +1,4 @@
-name: macOS DMG smoke test (download + verbose checks)
+name: macOS DMG MOUNT
 
 on:
   workflow_dispatch:
