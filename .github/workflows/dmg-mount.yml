@@ -1,4 +1,4 @@
-name: macOS DMG MOUNT
+name: macOS DMG smoke test (download + verbose checks)
 
 on:
   workflow_dispatch:
@@ -23,18 +23,27 @@ jobs:
 
       - name: Download DMG
         run: |
+          set -euo pipefail
           curl -L --fail --output "$DMG_PATH" "${{ github.event.inputs.dmg_url }}"
           ls -la "$DMG_PATH"
+          # Optional quick file-type sanity check
+          file "$DMG_PATH"
 
       - name: Verify SHA256 (optional)
         if: ${{ inputs.sha256 != '' }}
         run: echo "${{ github.event.inputs.sha256 }}  $DMG_PATH" | shasum -a 256 -c -
 
-      - name: Mount DMG (read-only, no Finder)
-        run: hdiutil attach "$DMG_PATH" -mountpoint "$MOUNTPOINT" -nobrowse -readonly
+      - name: Mount DMG (read-only, headless)
+        run: |
+          set -euo pipefail
+          hdiutil attach "$DMG_PATH" -mountpoint "$MOUNTPOINT" -nobrowse -readonly
+          echo "Mounted at: $MOUNTPOINT"
+          df -h
 
-      - name: List mounted volume
-        run: ls -la "$MOUNTPOINT"
+      - name: List mounted volume (top level)
+        run: |
+          set -euo pipefail
+          ls -la "$MOUNTPOINT"
 
       - name: Locate .app or .pkg inside DMG
         id: locate
@@ -43,6 +52,7 @@ jobs:
           PAYLOAD="$(/usr/bin/find "$MOUNTPOINT" -maxdepth 3 \( -name "*.app" -o -name "*.pkg" \) -print -quit)"
           if [ -z "$PAYLOAD" ]; then
             echo "No .app or .pkg found inside $MOUNTPOINT"
+            /usr/bin/find "$MOUNTPOINT" -maxdepth 3 -print
             exit 1
           fi
           echo "Found payload: $PAYLOAD"
@@ -55,16 +65,60 @@ jobs:
           fi
           printf 'payload=%s\n' "$PAYLOAD" >> "$GITHUB_OUTPUT"
 
-      - name: Gatekeeper assessment
+      # ---- Verbose diagnostics (apps only) ----
+      - name: Dump Info.plist (apps only)
+        if: ${{ steps.locate.outputs.payload_ext == 'app' }}
+        run: |
+          set -euo pipefail
+          APP="${{ steps.locate.outputs.payload }}"
+          if [ -f "$APP/Contents/Info.plist" ]; then
+            /usr/libexec/PlistBuddy -c "Print" "$APP/Contents/Info.plist" || true
+          else
+            echo "No Info.plist at $APP/Contents/Info.plist"
+          fi
+
+      - name: List Frameworks (apps only)
+        if: ${{ steps.locate.outputs.payload_ext == 'app' }}
+        run: |
+          set -euo pipefail
+          APP="${{ steps.locate.outputs.payload }}"
+          if [ -d "$APP/Contents/Frameworks" ]; then
+            echo "Contents of Frameworks (depth 2):"
+            /usr/bin/find "$APP/Contents/Frameworks" -maxdepth 2 -print
+          else
+            echo "No Frameworks directory found"
+          fi
+
+      - name: Code signature details (apps only)
+        if: ${{ steps.locate.outputs.payload_ext == 'app' }}
+        run: |
+          set -euo pipefail
+          APP="${{ steps.locate.outputs.payload }}"
+          echo "codesign -dv --verbose=4:"
+          (codesign -dv --verbose=4 "$APP" 2>&1) || true
+
+      # ---- Gatekeeper + signature checks ----
+      - name: Gatekeeper assessment (concise)
         run: spctl --assess --type "${{ steps.locate.outputs.spctl_type }}" -v "${{ steps.locate.outputs.payload }}" || true
+
+      - name: Gatekeeper assessment (verbose)
+        run: |
+          set -euo pipefail
+          echo "spctl -a -vv:"
+          (spctl -a -vv --type "${{ steps.locate.outputs.spctl_type }}" "${{ steps.locate.outputs.payload }}" 2>&1) || true
+          echo "spctl -a -vvvv:"
+          (spctl -a -vvvv --type "${{ steps.locate.outputs.spctl_type }}" "${{ steps.locate.outputs.payload }}" 2>&1) || true
 
       - name: Check quarantine flags (apps only)
         if: ${{ steps.locate.outputs.payload_ext == 'app' }}
         run: xattr -l "${{ steps.locate.outputs.payload }}" || true
 
-      - name: Verify code signature (apps only)
+      - name: Verify code signature (apps only, deep strict)
         if: ${{ steps.locate.outputs.payload_ext == 'app' }}
-        run: codesign --verify --deep --strict "${{ steps.locate.outputs.payload }}" || true
+        run: |
+          set -euo pipefail
+          echo "codesign --verify --deep --strict --verbose=4:"
+          (codesign --verify --deep --strict --verbose=4 "${{ steps.locate.outputs.payload }}" 2>&1) || true
 
       - name: Unmount DMG
         if: always()
