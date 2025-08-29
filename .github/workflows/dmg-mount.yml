@@ -1,0 +1,40 @@
+name: macOS DMG smoke test
+
+on:
+  workflow_dispatch:
+
+jobs:
+  test-dmg:
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+
+      # If your DMG was built in a previous job, download it instead of checkout:
+      # - uses: actions/download-artifact@v4
+      #   with:
+      #     name: WillowKickSnareInstaller   # artifact name
+      #     path: .
+
+      - name: Show macOS version
+        run: sw_vers
+
+      - name: Mount DMG
+        run: hdiutil attach "WillowKickSnareInstaller.dmg" -mountpoint /Volumes/Willow -nobrowse
+
+      - name: List contents
+        run: ls -la /Volumes/Willow
+
+      - name: Gatekeeper assessment (won't show GUI prompts)
+        run: spctl --assess --type execute -v "/Volumes/Willow/WillowKickSnareInstaller.app" || true
+        # If your DMG contains a .pkg instead of an .app, use:
+        # run: spctl --assess --type install -v "/Volumes/Willow/YourInstaller.pkg" || true
+
+      - name: Check quarantine flags
+        run: xattr -l "/Volumes/Willow/WillowKickSnareInstaller.app" || true
+
+      - name: Verify code signature (if signed)
+        run: codesign --verify --deep --strict "/Volumes/Willow/WillowKickSnareInstaller.app" || true
+
+      - name: Unmount DMG
+        if: always()
+        run: hdiutil detach /Volumes/Willow || true
