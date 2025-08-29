@@ -1,4 +1,4 @@
-name: Build DMGs from GCS URLs
+name: Build DMGs OS 13 and 14
 
 on:
   workflow_dispatch:
