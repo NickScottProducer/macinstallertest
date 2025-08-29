@@ -1,4 +1,4 @@
-name: macOS DMG smoke test
+name: macOS DMG MOUNT test
 
 on:
   workflow_dispatch:
