@@ -1,69 +1,139 @@
-# .github/workflows/build-dmgs.yml
-name: Build DMGs from macOS 13 & 14 zips
+name: Build DMGs from GCS URLs
 
 on:
   workflow_dispatch:
+    inputs:
+      zip13_url:
+        description: 'Public URL to macOS 13 .zip (GCS)'
+        required: false
+        default: ''
+      zip14_url:
+        description: 'Public URL to macOS 14 .zip (GCS)'
+        required: false
+        default: ''
+      volname:
+        description: 'DMG volume name'
+        required: false
+        default: 'Willow Drums Installer'
+      dmg_base:
+        description: 'Base name for output DMGs'
+        required: false
+        default: 'WillowKickSnareInstaller'
 
 jobs:
   build:
+    # Build each DMG on a modern runner. Skip a branch if its URL is empty.
     runs-on: macos-15
     strategy:
       matrix:
-        variant:
-          - { label: "macos-13", zip_path: "WillowKickSnareInstaller-macos-13.zip" }
-          - { label: "macos-14", zip_path: "WillowKickSnareInstaller-macos-14.zip" }
+        include:
+          - label: macos-13
+            url: ${{ github.event.inputs.zip13_url }}
+          - label: macos-14
+            url: ${{ github.event.inputs.zip14_url }}
+    if: ${{ matrix.url != '' }}
 
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Unzip .app
+      - name: Download ZIP
         shell: bash
         run: |
           set -euo pipefail
-          ZIP="${{ matrix.variant.zip_path }}"
-          [ -f "$ZIP" ] || { echo "ZIP not found: $ZIP"; exit 1; }
-          rm -rf build dmg_src
-          mkdir -p build
-          unzip -q "$ZIP" -d build
-          APP_PATH="$(find build -maxdepth 4 -type d -name '*.app' -print -quit)"
-          [ -n "$APP_PATH" ] || { echo "No .app found inside $ZIP"; exit 2; }
-          echo "APP_PATH=$APP_PATH" >> "$GITHUB_ENV"
+          curl -L --fail --retry 3 --retry-delay 2 "${{ matrix.url }}" -o build.zip
+          file build.zip || true
+          unzip -tq build.zip >/dev/null
 
-      - name: Create DMG
+      - name: Extract .app (handles nested zips and .bundle→.app fix)
+        shell: bash
+        run: |
+          set -euo pipefail
+          UNZIP="unzipped"
+          rm -rf "$UNZIP" && mkdir -p "$UNZIP"
+          unzip -q build.zip -d "$UNZIP"
+
+          APPDIR=""
+          for i in 1 2 3; do
+            # 1) .app bundle?
+            APPDIR="$(find "$UNZIP" -maxdepth 8 -type d -name '*.app' -print -quit || true)"
+            [ -n "$APPDIR" ] && break
+
+            # 2) Some builds yield APP.bundle; patch Info.plist + rename
+            BUNDLEDIR="$(find "$UNZIP" -maxdepth 8 -type d -name '*.bundle' -print -quit || true)"
+            if [ -n "$BUNDLEDIR" ]; then
+              PLIST="$BUNDLEDIR/Contents/Info.plist"
+              [ -f "$PLIST" ] && /usr/libexec/PlistBuddy -c 'Set :CFBundlePackageType APPL' "$PLIST" || true
+              [ -d "$BUNDLEDIR/Contents/MacOS" ] && chmod +x "$BUNDLEDIR"/Contents/MacOS/* || true
+              APPDIR="${BUNDLEDIR%.bundle}.app"
+              mv "$BUNDLEDIR" "$APPDIR"
+              break
+            fi
+
+            # 3) Expand one more nested zip (never unzip inside .app)
+            NZIP="$(find "$UNZIP" -maxdepth 8 -type f -name '*.zip' ! -path '*/.app/*' -print -quit || true)"
+            [ -z "$NZIP" ] && break
+            NDIR="$UNZIP/nest_$i"; mkdir -p "$NDIR"
+            unzip -q "$NZIP" -d "$NDIR"
+            rm -f "$NZIP"
+          done
+
+          if [ -z "$APPDIR" ]; then
+            echo "No .app found inside zip"
+            find "$UNZIP" -maxdepth 4 -print || true
+            exit 3
+          fi
+          case "$APPDIR" in */Contents) APPDIR="$(dirname "$APPDIR")";; esac
+          echo "APP_PATH=$APPDIR" >> "$GITHUB_ENV"
+          echo "APP_NAME=$(basename "$APPDIR")" >> "$GITHUB_ENV"
+
+      - name: Build DMG
         shell: bash
         run: |
           set -euo pipefail
           mkdir -p dmg_src
           cp -R "${APP_PATH}" dmg_src/
           ln -s /Applications dmg_src/Applications
-          DMG="WillowKickSnareInstaller-${{ matrix.variant.label }}.dmg"
+
+          # Ensure main executables are executable
+          if [ -d "dmg_src/${APP_NAME}/Contents/MacOS" ]; then
+            find "dmg_src/${APP_NAME}/Contents/MacOS" -type f -exec chmod +x {} \; || true
+          fi
+
+          DMG="${{ github.event.inputs.dmg_base }}-${{ matrix.label }}.dmg"
           hdiutil create \
-            -volname "Willow Drums Installer" \
+            -volname "${{ github.event.inputs.volname }}" \
             -srcfolder dmg_src \
             -ov -format UDZO "$DMG"
+
           echo "DMG=$DMG" >> "$GITHUB_ENV"
 
-      - name: Upload DMG
+      - name: Upload DMG artifact
         uses: actions/upload-artifact@v4
         with:
-          name: WillowKickSnareInstaller-${{ matrix.variant.label }}
+          name: ${{ github.event.inputs.dmg_base }}-${{ matrix.label }}
           path: ${{ env.DMG }}
 
   test:
     needs: build
+    # Run tests only for the variants that had URLs
     strategy:
       matrix:
-        os: [macos-13, macos-14]
+        include:
+          - os: macos-13
+            label: macos-13
+            url: ${{ github.event.inputs.zip13_url }}
+          - os: macos-14
+            label: macos-14
+            url: ${{ github.event.inputs.zip14_url }}
     runs-on: ${{ matrix.os }}
+    if: ${{ matrix.url != '' }}
+
     steps:
       - name: Download matching DMG
         uses: actions/download-artifact@v4
         with:
-          name: WillowKickSnareInstaller-${{ matrix.os }}
+          name: ${{ github.event.inputs.dmg_base }}-${{ matrix.label }}
           path: dist
 
-      - name: Mount and sanity-check
+      - name: Mount DMG, copy app, basic assessments
         shell: bash
         run: |
           set -euo pipefail
@@ -71,9 +141,10 @@ jobs:
           MNT=/Volumes/APPTEST
           hdiutil attach "$DMG" -mountpoint "$MNT" -nobrowse
           APP="$(find "$MNT" -maxdepth 1 -type d -name '*.app' -print -quit)"
-          [ -n "$APP" ] || { echo "No .app at DMG root"; find "$MNT" -maxdepth 2 -print; hdiutil detach "$MNT"; exit 3; }
+          [ -n "$APP" ] || { echo "No .app at DMG root"; find "$MNT" -maxdepth 2 -print; hdiutil detach "$MNT"; exit 4; }
           sudo cp -R "$APP" /Applications/
           hdiutil detach "$MNT"
+
           APPNAME="$(basename "$APP")"
           /usr/bin/spctl --assess --type execute -vv "/Applications/$APPNAME" || true
           /usr/bin/codesign -dv --verbose=4 "/Applications/$APPNAME" 2>&1 | tee codesign.txt
@@ -82,5 +153,4 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: macos-${{ matrix.os }}-test-logs
-          path: |
-            codesign.txt
+          path: codesign.txt
