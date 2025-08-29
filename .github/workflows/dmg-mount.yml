@@ -1,40 +1,71 @@
-name: macOS DMG MOUNT test
+name: macOS DMG smoke test (download from URL)
 
 on:
   workflow_dispatch:
+    inputs:
+      dmg_url:
+        description: "Public or signed URL to the DMG (e.g., https://storage.googleapis.com/<BUCKET>/<OBJECT>.dmg)"
+        required: true
+      sha256:
+        description: "Optional expected SHA256 checksum of the DMG"
+        required: false
 
 jobs:
-  test-dmg:
+  smoke:
     runs-on: macos-14
+    env:
+      MOUNTPOINT: /Volumes/WKSTest
+      DMG_PATH: WillowKickSnareInstaller.dmg
+
     steps:
-      - uses: actions/checkout@v4
-
-      # If your DMG was built in a previous job, download it instead of checkout:
-      # - uses: actions/download-artifact@v4
-      #   with:
-      #     name: WillowKickSnareInstaller   # artifact name
-      #     path: .
-
       - name: Show macOS version
         run: sw_vers
 
-      - name: Mount DMG
-        run: hdiutil attach "WillowKickSnareInstaller.dmg" -mountpoint /Volumes/Willow -nobrowse
+      - name: Download DMG
+        run: |
+          curl -L --fail --output "$DMG_PATH" "${{ github.event.inputs.dmg_url }}"
+          ls -la "$DMG_PATH"
 
-      - name: List contents
-        run: ls -la /Volumes/Willow
+      - name: Verify SHA256 (optional)
+        if: ${{ inputs.sha256 != '' }}
+        run: echo "${{ github.event.inputs.sha256 }}  $DMG_PATH" | shasum -a 256 -c -
 
-      - name: Gatekeeper assessment (won't show GUI prompts)
-        run: spctl --assess --type execute -v "/Volumes/Willow/WillowKickSnareInstaller.app" || true
-        # If your DMG contains a .pkg instead of an .app, use:
-        # run: spctl --assess --type install -v "/Volumes/Willow/YourInstaller.pkg" || true
+      - name: Mount DMG (read-only, no Finder)
+        run: hdiutil attach "$DMG_PATH" -mountpoint "$MOUNTPOINT" -nobrowse -readonly
 
-      - name: Check quarantine flags
-        run: xattr -l "/Volumes/Willow/WillowKickSnareInstaller.app" || true
+      - name: List mounted volume
+        run: ls -la "$MOUNTPOINT"
 
-      - name: Verify code signature (if signed)
-        run: codesign --verify --deep --strict "/Volumes/Willow/WillowKickSnareInstaller.app" || true
+      - name: Locate .app or .pkg inside DMG
+        id: locate
+        run: |
+          set -euo pipefail
+          PAYLOAD="$(/usr/bin/find "$MOUNTPOINT" -maxdepth 3 \( -name "*.app" -o -name "*.pkg" \) -print -quit)"
+          if [ -z "$PAYLOAD" ]; then
+            echo "No .app or .pkg found inside $MOUNTPOINT"
+            exit 1
+          fi
+          echo "Found payload: $PAYLOAD"
+          if [[ "$PAYLOAD" == *.pkg ]]; then
+            echo "spctl_type=install" >> "$GITHUB_OUTPUT"
+            echo "payload_ext=pkg" >> "$GITHUB_OUTPUT"
+          else
+            echo "spctl_type=execute" >> "$GITHUB_OUTPUT"
+            echo "payload_ext=app" >> "$GITHUB_OUTPUT"
+          fi
+          printf 'payload=%s\n' "$PAYLOAD" >> "$GITHUB_OUTPUT"
+
+      - name: Gatekeeper assessment
+        run: spctl --assess --type "${{ steps.locate.outputs.spctl_type }}" -v "${{ steps.locate.outputs.payload }}" || true
+
+      - name: Check quarantine flags (apps only)
+        if: ${{ steps.locate.outputs.payload_ext == 'app' }}
+        run: xattr -l "${{ steps.locate.outputs.payload }}" || true
+
+      - name: Verify code signature (apps only)
+        if: ${{ steps.locate.outputs.payload_ext == 'app' }}
+        run: codesign --verify --deep --strict "${{ steps.locate.outputs.payload }}" || true
 
       - name: Unmount DMG
         if: always()
-        run: hdiutil detach /Volumes/Willow || true
+        run: hdiutil detach "$MOUNTPOINT" || true
