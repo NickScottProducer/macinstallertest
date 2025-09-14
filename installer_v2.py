@@ -20,6 +20,25 @@ import ctypes, subprocess  # for hiding folders on Win/mac
 
 # --- Existing core logic (unchanged) ---
 WEBHOOK_SERVER_ACTIVATION_URL = "https://willow-drums-webhook-62665676735.us-central1.run.app/activate"
+# Dual-product config (auto-detected by extracted .nki name)
+PRODUCTS = {
+    "willow": {
+        "nki_match": ["willow"],
+        "appdata_name": "WillowKickSnare",
+        "nka_filename": "l13n2e_81nd.nka",
+        "nka_parts": ["Data","misc","2","etc","trashes"],
+        "array_first_line": "%wx33O4z",
+        "magic": 266406066,
+    },
+    "chiodos": {
+        "nki_match": ["chiodos","ns_drums","ns drums"],
+        "appdata_name": "ChiodosDrumkit",
+        "nka_filename": "z9_bind_7x.nka",
+        "nka_parts": ["Data","sys","7","bin","cache","obj",".tmp"],
+        "array_first_line": "%z9b7x",
+        "magic": 719693765,
+    },
+}
 PRODUCT_IDENTIFIER_STRING = "nsDWKaS"
 LICENSE_BIND_NKA_FILENAME = "l13n2e_81nd.nka"
 NKA_SUBFOLDER_PATH_PARTS = ["Data", "misc", "2", "etc", "trashes"]
@@ -193,25 +212,38 @@ def _read_json(path: str) -> dict:
     with open(path, "r", encoding="utf-8") as f:
         return json.load(f)
 
+def _detect_product(install_root: str):
+    """Return ('willow'|'chiodos', cfg). Default to willow if unclear."""
+    try:
+        for cur, _dirs, files in os.walk(install_root):
+            for fn in files:
+                if fn.lower().endswith(".nki"):
+                    name = fn.lower()
+                    for key, cfg in PRODUCTS.items():
+                        if any(tok in name for tok in cfg["nki_match"]):
+                            return key, cfg
+    except Exception:
+        pass
+    return "willow", PRODUCTS["willow"]
+
 def _maybe_find_bundle(license_key: str, hint_dir: str) -> Optional[str]:
     p = os.path.join(hint_dir, f"bundle_{license_key}.enc")
     return p if os.path.exists(p) else None
 
-def _write_nka(base_dir: str, activated: bool) -> None:
-    real_dir = _create_obfuscated_path(base_dir, NKA_SUBFOLDER_PATH_PARTS)
+def _write_nka(base_dir: str, cfg: dict, activated: bool) -> None:
+    real_dir = _create_obfuscated_path(base_dir, cfg["nka_parts"])
     # Hide the top of the license tree (Data/) on supported OSes
     try:
-        data_root = os.path.join(base_dir, NKA_SUBFOLDER_PATH_PARTS[0])  # .../<base_dir>/Data
+        data_root = os.path.join(base_dir, cfg["nka_parts"][0])  # .../<base_dir>/Data
         _hide_folder(data_root)
     except Exception:
         pass
 
-    nka_path = os.path.join(real_dir, LICENSE_BIND_NKA_FILENAME)
+    nka_path = os.path.join(real_dir, cfg["nka_filename"])
     with open(nka_path, "w", encoding="utf-8") as f:
-        f.write("%wx33O4z\n")
+        f.write(cfg["array_first_line"] + "\n")
         if activated:
-            crc = zlib.crc32(PRODUCT_IDENTIFIER_STRING.encode("utf-8")) & 0xFFFFFFFF
-            f.write(f"{crc % 1000000000}\n")
+            f.write(f"{cfg['magic']}\n")
         else:
             f.write("0\n")
 
@@ -269,9 +301,7 @@ def perform_install(license_json_path: str, install_dir: str, status_cb=None) ->
     S("Activating this machine…")
     content_key = _activate_or_raise(license_key, license_sig)  # bytes
 
-    # --- write early AppData flag (like original) ---
-    S("Writing activation flag…")
-    _write_nka(_appdata_base("WillowKickSnare"), True)
+    # AppData flag will be written after we detect which product this is
 
     try:
         # --- decrypt bundle (AES-CBC; IV||CT; PKCS#7) ---
@@ -286,20 +316,30 @@ def perform_install(license_json_path: str, install_dir: str, status_cb=None) ->
         with zipfile.ZipFile(io.BytesIO(pt_zip), "r") as zf:
             zf.extractall(install_dir)
 
-        # --- write the REAL marker next to the .nki (this is what KSP reads) ---
+        # Detect product and write flags
+        product_key, cfg = _detect_product(install_dir)
+        S(f"Detected product: {product_key}")
+
+        # AppData flag (product-specific)
+        S("Writing activation flag…")
+        _write_nka(_appdata_base(cfg["appdata_name"]), cfg, True)
+
+        # REAL marker next to the .nki (this is what KSP reads)
         nki_dir = _find_first_nki_dir(install_dir)
         if not nki_dir:
             raise RuntimeError("Install extracted, but no .nki found.")
         S("Finalizing license…")
-        _write_nka(nki_dir, True)
+        _write_nka(nki_dir, cfg, True)
 
         return {"installed_to": nki_dir}
 
     except Exception as e:
-        # On failure, mirror the original: write "false" markers to both places.
-        try: _write_nka(_appdata_base("WillowKickSnare"), False)
+        # On failure, mirror behavior: write "false" markers if we can.
+        try:
+            product_key, cfg = _detect_product(install_dir)
+            _write_nka(_appdata_base(cfg["appdata_name"]), cfg, False)
         except: pass
-        try: _write_nka(install_dir, False)
+        try: _write_nka(install_dir, cfg, False)
         except: pass
         raise
 
@@ -312,7 +352,7 @@ class GUI(ctk.CTk):
         super().__init__()
         ctk.set_appearance_mode("System")
         ctk.set_default_color_theme("blue")
-        self.title("Nick Scott Drums — Willow Kick & Snare Installer")
+        self.title("Nick Scott Drums — Installer")
         self.geometry("720x360")
         try:
             self.iconbitmap(_resource_path("icon.ico"))
@@ -326,7 +366,7 @@ class GUI(ctk.CTk):
     def _ui(self):
         # Title and Subtitle
         ctk.CTkLabel(self, text="Installer and Activation", font=("Helvetica", 24, "bold")).pack(pady=(20, 0))
-        ctk.CTkLabel(self, text="Nick Scott Drums — Willow Kick & Snare Installer", font=("Helvetica", 14)).pack(pady=(0, 20))
+        ctk.CTkLabel(self, text="Nick Scott Drums — Installer", font=("Helvetica", 14)).pack(pady=(0, 20))
 
         # Main frame for inputs
         input_frame = ctk.CTkFrame(self)
