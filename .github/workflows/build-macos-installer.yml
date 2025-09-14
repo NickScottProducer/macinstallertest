@@ -1,16 +1,15 @@
-name: build macOS installer
+name: build macOS installers (13 + 14)
 
 on:
-  workflow_dispatch:
-    inputs:
-      app_name:
-        description: 'App name (e.g., Installer, WillowKickSnareInstaller, ChiodosDrumkitInstaller)'
-        required: false
-        default: 'Installer'
+  workflow_dispatch: {}
 
 jobs:
   build:
-    runs-on: macos-15
+    strategy:
+      matrix:
+        os: [macos-13, macos-14]   # 13=x86_64, 14=arm64
+        app: [WillowKickSnareInstaller, ChiodosDrumkitInstaller]
+    runs-on: ${{ matrix.os }}
 
     steps:
       - uses: actions/checkout@v4
@@ -20,53 +19,42 @@ jobs:
         with:
           python-version: '3.11'
 
+      - name: Show runner env
+        run: |
+          sw_vers
+          uname -m
+
       - name: Install deps
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt pyinstaller
 
-      - name: Build .app with PyInstaller (GUI)
+      # Optional: use a mac icon if you later add icon.icns to the repo
+      - name: Determine icon flag
         run: |
-          APP_NAME="${{ github.event.inputs.app_name }}"
+          if [ -f icon.icns ]; then echo "ICON_FLAG=--icon icon.icns" >> $GITHUB_ENV; else echo "ICON_FLAG=" >> $GITHUB_ENV; fi
+
+      - name: Build .app with PyInstaller
+        run: |
+          APP="${{ matrix.app }}"
           pyinstaller installer_v2.py \
-            --name "$APP_NAME" \
+            --name "$APP" \
             --windowed --clean \
             --collect-data customtkinter \
-            --collect-submodules Crypto
+            --collect-submodules Crypto \
+            $ICON_FLAG
 
-      - name: Create DMG
+      - name: Create DMG with hdiutil
         run: |
-          brew install create-dmg || true
-          create-dmg --overwrite \
-            --dmg-title "${{ github.event.inputs.app_name }}" \
-            "dist/${{ github.event.inputs.app_name }}.app" \
-            "dist/${{ github.event.inputs.app_name }}.dmg"
+          APP="${{ matrix.app }}"
+          ARCH=$(uname -m)  # x86_64 on macos-13, arm64 on macos-14
+          mkdir -p "dmgroot"
+          cp -R "dist/${APP}.app" "dmgroot/"
+          hdiutil create -volname "${APP}" -srcfolder "dmgroot" -ov -format UDZO "dist/${APP}-${ARCH}.dmg"
+          rm -rf dmgroot
 
-      # OPTIONAL: Code sign + notarize (requires secrets below)
-      # - name: Import signing cert
-      #   uses: apple-actions/import-codesign-certs@v2
-      #   with:
-      #     p12-file-base64: ${{ secrets.MACOS_CERT_P12 }}
-      #     p12-password: ${{ secrets.MACOS_CERT_PASSWORD }}
-      #
-      # - name: Codesign .app and DMG
-      #   run: |
-      #     IDENTITY="${{ secrets.MACOS_CODESIGN_IDENTITY }}" # e.g. "Developer ID Application: Your Name (TEAMID)"
-      #     /usr/bin/codesign --deep --force --options runtime --sign "$IDENTITY" "dist/${{ github.event.inputs.app_name }}.app"
-      #     /usr/bin/codesign --force --sign "$IDENTITY" "dist/${{ github.event.inputs.app_name }}.dmg"
-      #
-      # - name: Notarize (App Store Connect API key)
-      #   run: |
-      #     echo "${{ secrets.AC_API_KEY_P8 }}" > authkey.p8
-      #     xcrun notarytool submit "dist/${{ github.event.inputs.app_name }}.dmg" \
-      #       --key authkey.p8 \
-      #       --key-id "${{ secrets.AC_API_KEY_ID }}" \
-      #       --issuer "${{ secrets.AC_API_ISSUER_ID }}" \
-      #       --wait
-      #     xcrun stapler staple "dist/${{ github.event.inputs.app_name }}.dmg"
-
-      - name: Upload artifact (DMG)
+      - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: mac-installer-${{ github.event.inputs.app_name }}
-          path: dist/${{ github.event.inputs.app_name }}.dmg
+          name: "${{ matrix.app }}-${{ matrix.os }}"
+          path: "dist/${{ matrix.app }}-*.dmg"
