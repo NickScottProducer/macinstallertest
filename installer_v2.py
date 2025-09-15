@@ -19,7 +19,11 @@ import ctypes, subprocess  # for hiding folders on Win/mac
 
 
 # --- Existing core logic (unchanged) ---
-WEBHOOK_SERVER_ACTIVATION_URL = "https://willow-drums-webhook-62665676735.us-central1.run.app/activate"
+WEBHOOK_SERVER_ACTIVATION_URL = os.environ.get(
+    "ACTIVATION_URL",
+    "https://willow-drums-webhook-ahuxffwn4q-uc.a.run.app/activate"
+)
+
 # Dual-product config (auto-detected by extracted .nki name)
 PRODUCTS = {
     "willow": {
