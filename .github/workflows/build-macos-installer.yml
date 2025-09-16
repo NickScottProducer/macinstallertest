@@ -34,6 +34,16 @@ jobs:
         run: |
           if [ -f icon.icns ]; then echo "ICON_FLAG=--icon icon.icns" >> $GITHUB_ENV; else echo "ICON_FLAG=" >> $GITHUB_ENV; fi
 
+      # Map runner arch -> human-friendly label for filenames
+      - name: Set arch label
+        run: |
+          ARCH="$(uname -m)"
+          if [ "$ARCH" = "x86_64" ]; then
+            echo "ARCH_LABEL=macOS-Intel" >> $GITHUB_ENV
+          else
+            echo "ARCH_LABEL=macOS-AppleSilicon" >> $GITHUB_ENV
+          fi
+
       - name: Build .app with PyInstaller
         run: |
           APP="${{ matrix.app }}"
@@ -47,14 +57,15 @@ jobs:
       - name: Create DMG with hdiutil
         run: |
           APP="${{ matrix.app }}"
-          ARCH=$(uname -m)  # x86_64 on macos-13, arm64 on macos-14
           mkdir -p "dmgroot"
           cp -R "dist/${APP}.app" "dmgroot/"
-          hdiutil create -volname "${APP}" -srcfolder "dmgroot" -ov -format UDZO "dist/${APP}-${ARCH}.dmg"
+          DMG_NAME="${APP}-${ARCH_LABEL}.dmg"
+          hdiutil create -volname "${APP}" -srcfolder "dmgroot" -ov -format UDZO "dist/${DMG_NAME}"
           rm -rf dmgroot
+          echo "DMG_NAME=${DMG_NAME}" >> $GITHUB_ENV
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: "${{ matrix.app }}-${{ matrix.os }}"
-          path: "dist/${{ matrix.app }}-*.dmg"
+          name: "${{ matrix.app }}-${{ env.ARCH_LABEL }}"
+          path: "dist/${{ env.DMG_NAME }}"
