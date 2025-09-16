@@ -40,7 +40,7 @@ PRODUCTS = {
         "nka_filename": "z9_bind_7x.nka",
         "nka_parts": ["Data","sys","7","bin","cache","obj",".tmp"],
         "array_first_line": "%z9b7x",
-        "magic": 719693765,
+        "magic": 119693765,
     },
 }
 PRODUCT_IDENTIFIER_STRING = "nsDWKaS"
@@ -457,3 +457,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
